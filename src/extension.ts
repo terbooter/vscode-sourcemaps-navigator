@@ -1,11 +1,12 @@
 'use strict';
 
 import * as vscode from 'vscode';
-import { Selection, OutputChannel } from 'vscode';
+import { Selection, OutputChannel, TextEditor, TextDocument } from 'vscode';
 import { FilePosition } from './filePosition';
 import { SourceMapStore } from './sourceMapStore';
 import { SourceMapLinkProvider } from './sourceMapLinkProvider';
 import { SourceMapContentProvider } from './sourceMapContentProvider';
+import { SourceMapItem } from "./sourceMapItem";
 
 let sourceMapStore: SourceMapStore;
 let outputChannel: OutputChannel;
@@ -42,18 +43,19 @@ export function activate(context: vscode.ExtensionContext) {
  * In case of errors reports them via informational message and prints error trace
  * to output window.
  */
-function navigate() {
-    sourceMapStore.getForCurrentDocument()
-    .then(sourceMapping => {
+async function navigate() {
+    try {
+        const sm: SourceMapItem = await sourceMapStore.getForCurrentDocument();
         const activePosition = FilePosition.getActivePosition();
-        return sourceMapping.isCurrentDocumentGenerated() ?
-            sourceMapping.originalPositionFor(activePosition) :
-            sourceMapping.generatedPositionFor(activePosition);
-    })
-    .then(destinationPosition =>
-        navigateToDestination(destinationPosition))
-    .catch((err: string|Error) => {
-        let message: string  = typeof err === 'string' ? err :
+        let destinationPosition;
+        if (sm.isCurrentDocumentGenerated()) {
+            destinationPosition = sm.originalPositionFor(activePosition);
+        } else {
+            destinationPosition = sm.generatedPositionFor(activePosition);
+        }
+        await navigateToDestination(destinationPosition);
+    } catch (err) {
+        let message: string = typeof err === 'string' ? err :
             (err as Error).message;
 
         vscode.window.showWarningMessage(`Can\'t get source map for current document: ${message}`);
@@ -61,49 +63,35 @@ function navigate() {
         if (err instanceof Error && err.stack) {
             getOutputChannel().appendLine(err.stack);
         }
-    });
+    }
 }
 
-/**
- * Opens the file at position, specified in filePosition parameter
- * @returns {Promise}
- */
-function navigateToDestination(destination: FilePosition): Promise<void> {
-    return promisify(vscode.workspace.openTextDocument(destination.file))
-        .catch(() => {
-            if (!destination.contents) {
-                return Promise.reject(`Original source doesn't exist and source map doesn't provide inline source`);
-            }
+async function navigateToDestination(destination: FilePosition): Promise<void> {
+    let textDocument: TextDocument;
+    try {
+        textDocument = await vscode.workspace.openTextDocument(destination.file)
+    } catch (err) {
+        if (!destination.contents) {
+            throw new Error(`Original source doesn't exist and source map doesn't provide inline source`);
+        }
 
-            const untitledFile = vscode.Uri.file(destination.file).with({ scheme: 'untitled' });
-            return vscode.workspace.openTextDocument(untitledFile);
-        })
-        .then(vscode.window.showTextDocument)
-        .then(editor => {
-            if (!editor.document.isUntitled) {
-                return editor;
-            }
+        const untitledFile = vscode.Uri.file(destination.file).with({ scheme: 'untitled' });
+        textDocument = await vscode.workspace.openTextDocument(untitledFile);
+    }
 
-            const builderOptions = { undoStopBefore: false, undoStopAfter: true };
-            return editor
-                .edit(builder => {
-                    const wholeDoc = new vscode.Range(
-                        editor.document.positionAt(0),
-                        editor.document.positionAt(editor.document.getText().length)
-                    );
-                    return builder.replace(wholeDoc, destination.contents);
-                }, builderOptions)
-                .then(() => editor);
-        })
-        .then((editor: vscode.TextEditor) => {
-            editor.selection = new Selection(destination, destination);
-            editor.revealRange(editor.selection, vscode.TextEditorRevealType.InCenter);
-        });
+    let editor: TextEditor = await vscode.window.showTextDocument(textDocument);
+    if (editor.document.isUntitled) {
+        const builderOptions = { undoStopBefore: false, undoStopAfter: true };
+        const callback = (builder: any) => {
+            const wholeDoc = new vscode.Range(
+                editor.document.positionAt(0),
+                editor.document.positionAt(editor.document.getText().length)
+            );
+            return builder.replace(wholeDoc, destination.contents);
+        }
+        await editor.edit(callback, builderOptions)
+    }
 
-}
-
-function promisify<T>(thenable: Thenable<T>): Promise<T> {
-    return new Promise<T>((resolve, reject) => {
-        thenable.then(resolve, reject);
-    });
+    editor.selection = new Selection(destination, destination);
+    editor.revealRange(editor.selection, vscode.TextEditorRevealType.InCenter);
 }

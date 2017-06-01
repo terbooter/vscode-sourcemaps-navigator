@@ -1,4 +1,3 @@
-
 import { CancellationToken, TextDocumentContentProvider, Uri } from 'vscode';
 
 export class SourceMapContentProvider implements TextDocumentContentProvider {

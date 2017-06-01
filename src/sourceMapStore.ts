@@ -3,13 +3,14 @@ import * as path from 'path';
 import * as vscode from 'vscode';
 import { Disposable, FileSystemWatcher, Range, TextDocument } from 'vscode';
 import { SourceMapItem } from './sourceMapItem';
-import { rejectsWith, safeMethod } from './decorators';
+import { safeMethod } from './decorators';
 
 export class SourceMapStore implements Disposable {
-    private cache: {[generatedPath: string]: SourceMapItem} = {};
+    private cache: { [generatedPath: string]: SourceMapItem } = {};
     /** A table for reverse lookup, i.e. to find map for file generated from this one */
-    private reverseLookupTable: {[sourcePath: string]: string } = {};
-    private watchers: {[path: string]: FileSystemWatcher} = {};
+    private reverseLookupTable: { [sourcePath: string]: string } = {};
+    private watchers: { [path: string]: FileSystemWatcher } = {};
+    private fetcher = new SourceMapFetcher();
 
     @safeMethod
     private addItem(item: SourceMapItem): void {
@@ -49,22 +50,35 @@ export class SourceMapStore implements Disposable {
         Object.keys(this.cache).forEach(key => this.removeItem(key));
     }
 
-    @rejectsWith(`Can't retrieve source maps for current document`)
-    public getForCurrentDocument(): Promise<SourceMapItem> {
+    public async getForCurrentDocument(): Promise<SourceMapItem> {
         const currentDocument = vscode.window.activeTextEditor.document;
         const result =
             this.cache[currentDocument.fileName] ||
-            this.reverseLookup(currentDocument.fileName) ||
-            fetchSourceMapUrl(currentDocument)
-            .then(({mapUrl, fileUrl}: SourceMapFetchResult) => isDataUri(mapUrl) ?
-                SourceMapItem.fromDataUrl(mapUrl, fileUrl) :
-                SourceMapItem.fromFile(mapUrl))
-            .then(sourceMapItem => {
-                this.addItem(sourceMapItem);
-                return sourceMapItem;
-            });
+            this.reverseLookup(currentDocument.fileName);
 
-        return Promise.resolve(result);
+        if (!result) {
+            const item = await this.fetch(currentDocument);
+            this.addItem(item);
+            return item;
+        }
+
+        return result;
+    }
+
+    private async fetch(currentDocument: TextDocument): Promise<SourceMapItem> {
+        let item: SourceMapItem;
+        try {
+            const { mapUrl, fileUrl } = this.fetcher.fetch(currentDocument);
+            if (isDataUri(mapUrl)) {
+                item = await SourceMapItem.fromDataUrl(mapUrl, fileUrl)
+            } else {
+                item = await SourceMapItem.fromFile(mapUrl);
+            }
+        } catch (err) {
+            throw new Error(`Can't retrieve source maps for current document`);
+        }
+
+        return item;
     }
 }
 
@@ -97,27 +111,30 @@ function isDataUri(url: string): boolean {
     return Url.parse(url).protocol === 'data:';
 }
 
-function fetchSourceMapUrl(document: TextDocument): Promise<SourceMapFetchResult> {
-    const SOURCE_MAPPING_MATCHER = new RegExp('^//[#@] ?sourceMappingURL=(.+)$');
-    const lastTenLines = new Range(document.lineCount - 10, 0, document.lineCount + 1, 0);
+class SourceMapFetcher {
 
-    function tryExtractUrl(line: string): string {
-        const matches = SOURCE_MAPPING_MATCHER.exec(line.trim());
+    private static SOURCE_MAPPING_MATCHER = new RegExp('^//[#@] ?sourceMappingURL=(.+)$');
+
+    public fetch(document: TextDocument): SourceMapFetchResult {
+        const lastTenLines = new Range(document.lineCount - 10, 0, document.lineCount + 1, 0);
+        const fetchedMapUrl = document.getText(lastTenLines).split('\n')
+            .reduceRight<string>((result, line) => {
+                return result || this.tryExtractUrl(line);
+            }, "");
+
+        if (!fetchedMapUrl) {
+            throw new Error(`Can't fetch url from current document at ${document.fileName}`);
+        }
+
+        const fileUrl = document.fileName;
+        const mapUrl = isDataUri(fetchedMapUrl) ? fetchedMapUrl :
+            path.resolve(path.dirname(fileUrl), fetchedMapUrl);
+
+        return { mapUrl, fileUrl };
+    }
+
+    private tryExtractUrl(line: string): string {
+        const matches = SourceMapFetcher.SOURCE_MAPPING_MATCHER.exec(line.trim());
         return matches && matches.length === 2 ? matches[1].trim() : "";
     }
-
-    const fetchedMapUrl = document.getText(lastTenLines).split('\n')
-    .reduceRight<string>((result, line) => {
-        return result || tryExtractUrl(line);
-    }, "");
-
-    if (!fetchedMapUrl) {
-        return Promise.reject(`Can't fetch url from current document at ${document.fileName}`);
-    }
-
-    const fileUrl = document.fileName;
-    const mapUrl = isDataUri(fetchedMapUrl) ? fetchedMapUrl :
-        path.resolve(path.dirname(fileUrl), fetchedMapUrl);
-
-    return Promise.resolve({mapUrl, fileUrl});
 }
